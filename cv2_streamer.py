@@ -1,6 +1,31 @@
 import argparse
+import importlib
+import threading as th
+import time
 
+import pip
+
+
+def import_package(package, pip_name=None):
+    try:
+        importlib.import_module(package)
+    except ImportError:
+        print(f"Package {package} not found, installing...")
+        if pip_name is None:
+            pip.main(["install", package])
+        else:
+            pip.main(["install", pip_name])
+        print(f"Package {package} installed, retrying...")
+        import_package(package)
+
+
+import_package("cv2", "opencv-python")
+import_package("numpy")
+import_package("flask", "Flask")
+import_package("flask_cors", "flask-cors")
+import_package("gevent.pywsgi", "gevent")
 import cv2
+import numpy as np
 from flask import Flask, Response, request
 from flask_cors import CORS
 from gevent.pywsgi import WSGIServer
@@ -16,7 +41,7 @@ video_device = args.device
 video_width = int(args.res.split("x")[0])
 video_height = int(args.res.split("x")[1])
 video_fps = args.fps
-
+quality = args.quality
 running = True
 
 if video_device < 0:
@@ -34,30 +59,47 @@ if not cap.isOpened():
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, video_width)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, video_height)
 cap.set(cv2.CAP_PROP_FPS, video_fps)
-print(
-    f"Opend camera-{video_device}: {cap.get(cv2.CAP_PROP_FRAME_WIDTH)}x{cap.get(cv2.CAP_PROP_FRAME_HEIGHT)}@{cap.get(cv2.CAP_PROP_FPS)}"
-)
+true_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+true_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+true_fps = int(cap.get(cv2.CAP_PROP_FPS))
+print(f"Opend camera-{video_device}: {true_width}x{true_height}@{true_fps}fps")
 
-
-def get_stream():
-    while running:
-        status, frame = cap.read()
-        if not status:
-            break
-        image = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, args.quality])[1]
-        yield (b"Content-Type: image/jpeg\r\n\r\n" + image.tobytes() + b"\r\n\r\n--frame\r\n")
-
-
-def get_snapshot():
-    status, frame = cap.read()
-    if not status:
-        return b""
-    image = cv2.imencode(".jpg", frame)[1]
-    return image.tobytes()
+image = np.zeros((true_height, true_width, 3), np.uint8)
+image_event = th.Event()
 
 
 app = Flask(__name__)
 CORS(app, supports_credentials=True, allow_headers="*")
+
+
+def stream_worker():
+    global image
+    while running:
+        status, frame = cap.read()
+        if not status:
+            continue
+        image = frame
+        image_event.set()
+
+
+th.Thread(target=stream_worker, daemon=True).start()
+
+
+def get_stream():
+    while running:
+        image_event.wait()
+        image_event.clear()
+        frame = image.copy()
+        data = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])[1]
+        yield (b"Content-Type: data/jpeg\r\n\r\n" + data.tobytes() + b"\r\n\r\n--frame\r\n")
+
+
+def get_snapshot():
+    image_event.wait()
+    image_event.clear()
+    frame = image.copy()
+    data = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])[1]
+    return data.tobytes()
 
 
 @app.route("/")
@@ -67,7 +109,7 @@ def index():
         return Response(get_stream(), mimetype="multipart/x-mixed-replace; boundary=frame")
     elif action == "snapshot":
         return Response(get_snapshot(), mimetype="image/jpeg")
-    return Response("server online", status=200)
+    return Response("Server online", status=200)
 
 
 @app.route("/stream")
@@ -78,6 +120,36 @@ def http_stream():
 @app.route("/snapshot")
 def http_snapshot():
     return Response(get_snapshot(), mimetype="image/jpeg")
+
+
+@app.route("/config")
+def http_config():
+    res = request.args.get("res", None)
+    fps = request.args.get("fps", None)
+    quality = request.args.get("quality", None)
+    if not any([res, fps, quality]):
+        return Response("No config provided, available: res, fps, quality", status=400)
+    if res is not None:
+        global video_width, video_height
+        video_width = int(res.split("x")[0])
+        video_height = int(res.split("x")[1])
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, video_width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, video_height)
+    if fps is not None:
+        global video_fps
+        video_fps = int(fps)
+        cap.set(cv2.CAP_PROP_FPS, video_fps)
+    global true_height, true_width, true_fps
+    true_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    true_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    true_fps = int(cap.get(cv2.CAP_PROP_FPS))
+    if quality is not None:
+        global video_quality
+        video_quality = int(quality)
+    text = f"New config: {true_width}x{true_height}@{true_fps}fps, quality={video_quality}"
+    print(text)
+    return Response(text, status=200)
+
 
 print(f"Running streamer on port {args.port}")
 # server = WSGIServer(("0.0.0.0", args.port), app)

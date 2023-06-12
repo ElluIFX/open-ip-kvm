@@ -7,7 +7,7 @@
     "fps": 60,
     "format": "auto",
     "stream_port": 10120,
-    "backend": "ustreamer",
+    "backend": "custom",
     "custom_cmd": "python cv2_streamer.py -r $res -f $fps -p $stream_port",
     "sudo": false
   }
